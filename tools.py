@@ -79,7 +79,6 @@ VALID_ENTITIES = {"users", "products"}
 
 
 def execute_tool(tool_name: str, input: dict) -> dict:
-    print(f"Executing tool {tool_name} with input: {input}")
     entity = input.get("entity")
     if entity not in VALID_ENTITIES:
         return {"success": False, "error": f"Unknown entity: {entity}"}

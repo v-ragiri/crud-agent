@@ -19,6 +19,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise RuntimeError("GEMINI_API_KEY not found in environment — check your .env file")
@@ -44,6 +45,7 @@ GEMINI_TOOLS = types.Tool(
     ]
 )
 
+# print(f'Loaded tools: {GEMINI_TOOLS}')
 
 @app.post("/api/agent", response_model=AgentResponse)
 async def agent(request: AgentRequest):

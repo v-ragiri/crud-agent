@@ -70,7 +70,8 @@ export default function App() {
         CRUD Agent
       </h1>
       <p style={{ fontSize: 13, color: "#666", marginBottom: 20 }}>
-        Powered by Claude + FastAPI + PostgreSQL
+        Powered by Gemini + FastAPI + In-memory DB. Try the suggestions or type
+        your own commands to manage users and products.
       </p>
 
       {/* Chat window */}
