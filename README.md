@@ -1,3 +1,5 @@
+<<<<<<< HEAD
+
 # CRUD Agent — FastAPI + PostgreSQL + Claude + React
 
 ## Project structure
@@ -76,7 +78,13 @@ Browser ← { reply: "...", messages: [...] }
 
 ## Environment variables
 
-| Variable | Description |
-|---|---|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key |
-| `DATABASE_URL` | PostgreSQL connection string |
+| Variable            | Description                  |
+| ------------------- | ---------------------------- |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key       |
+| `DATABASE_URL`      | PostgreSQL connection string |
+
+=======
+
+# crud-agent
+
+> > > > > > > e1c7b1382abc01a26ddd68a7c14b69774fecb38c
