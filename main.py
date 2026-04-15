@@ -8,8 +8,8 @@ from google.genai import types
 import json
 import os
 
-from schemas import AgentRequest, AgentResponse
-from tools import TOOLS, execute_tool
+from schemas import AgentRequest, AgentResponse, PendingToolCall, ResumeRequest
+from tools_cutter import TOOLS, CLIENT_SIDE_TOOLS, execute_tool
 
 app = FastAPI(title="CRUD Agent API")
 
@@ -20,20 +20,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY not found in environment — check your .env file")
-client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-SYSTEM_PROMPT = """You are a data management assistant. You manage two entities:
-- users (fields: name, email, role)
-- products (fields: name, price, category)
+SYSTEM_PROMPT = """You are a data management assistant. You manage users, products, and tabs.
 
-Use the provided tools for ALL operations. Be concise.
+Tools available:
+- auto_create_tabs_from_tags: create tabs from tags (runs on client — reads tags and cuts directly from the DOM, no input needed from the user)
+- read_tabs: read/filter tabs (runs on client)
+- move_cut_between_tabs: move one or more cuts from one existing tab to another existing tab by names (runs on client)
+- read_records: list or search users/products (runs on server)
+- update_record: update a user or product by ID (runs on server)
+- delete_record: delete a user or product by ID (runs on server)
+
+Use tools for ALL operations. Be concise.
+Never call auto_create_tabs_from_tags unless the user explicitly asks to create/auto-create/generate tabs.
+For tab queries (list/read/show/find/filter), prefer read_tabs and do not create tabs implicitly.
+Before moving a cut between tabs, call read_tabs if tab/cut names are unclear.
 When a user refers to a record by name instead of ID, call read_records first to find the ID.
-For deletes and updates, confirm what was done after the tool call succeeds."""
+Confirm what was done after every delete or update."""
 
-# Convert from our generic tool format to Gemini's FunctionDeclaration format
 GEMINI_TOOLS = types.Tool(
     function_declarations=[
         types.FunctionDeclaration(
@@ -45,16 +50,61 @@ GEMINI_TOOLS = types.Tool(
     ]
 )
 
-# print(f'Loaded tools: {GEMINI_TOOLS}')
 
-@app.post("/api/agent", response_model=AgentResponse)
-async def agent(request: AgentRequest):
-    # Build Gemini-style contents from conversation history
+def _serialize_contents(contents: list) -> list:
+    """Convert Gemini Content objects to plain dicts for JSON serialization."""
+    out = []
+    for c in contents:
+        parts = []
+        for p in (c.parts or []):
+            if p.text is not None:
+                parts.append({"type": "text", "text": p.text})
+            elif p.function_call is not None:
+                parts.append({
+                    "type": "function_call",
+                    "name": p.function_call.name,
+                    "args": dict(p.function_call.args),
+                    "id": getattr(p.function_call, "id", None) or p.function_call.name,
+                })
+            elif p.function_response is not None:
+                parts.append({
+                    "type": "function_response",
+                    "name": p.function_response.name,
+                    "response": dict(p.function_response.response),
+                })
+        out.append({"role": c.role, "parts": parts})
+    return out
+
+
+def _deserialize_contents(raw: list) -> list:
+    """Rebuild Gemini Content objects from serialized dicts (for resume)."""
     contents = []
-    for m in request.messages:
-        role = "user" if m.role == "user" else "model"
-        contents.append(types.Content(role=role, parts=[types.Part(text=m.content)]))
+    for item in raw:
+        parts = []
+        for p in item.get("parts", []):
+            if p["type"] == "text":
+                parts.append(types.Part(text=p["text"]))
+            elif p["type"] == "function_call":
+                parts.append(types.Part(
+                    function_call=types.FunctionCall(name=p["name"], args=p["args"])
+                ))
+            elif p["type"] == "function_response":
+                parts.append(types.Part(
+                    function_response=types.FunctionResponse(
+                        name=p["name"], response=p["response"]
+                    )
+                ))
+        contents.append(types.Content(role=item["role"], parts=parts))
+    return contents
 
+
+async def _run_agent_loop(contents: list) -> AgentResponse:
+    """
+    Core agent loop — shared by both /api/agent and /api/agent/resume.
+    Runs until either:
+      - The model returns plain text  → returns final AgentResponse with reply
+      - A client-side tool is hit     → pauses and returns pending_tool_call
+    """
     while True:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -66,38 +116,115 @@ async def agent(request: AgentRequest):
         )
 
         candidate = response.candidates[0]
-        contents.append(candidate.content)  # add model turn to history
+        contents.append(candidate.content)
 
-        # Collect any function calls in this response
-        function_calls = [
-            p for p in candidate.content.parts if p.function_call is not None
-        ]
+        parts = candidate.content.parts or []
+        function_calls = [p for p in parts if p.function_call is not None]
 
-        if function_calls:
-            # Execute each tool call and collect results
-            tool_results = []
-            for part in function_calls:
-                fc = part.function_call
+        if not function_calls:
+            # Plain text — we're done
+            return AgentResponse(
+                reply=response.text or "Done.",
+                pending_tool_call=None,
+                messages=_serialize_contents(contents),
+            )
+
+        # Check if any tool in this batch is a client-side tool.
+        # If so, pause on the FIRST client-side one (handle one at a time).
+        server_results = []
+        paused_on = None
+
+        for part in function_calls:
+            fc = part.function_call
+            tool_id = getattr(fc, "id", None) or fc.name  # fc.id is None in some SDK versions
+
+            if fc.name in CLIENT_SIDE_TOOLS:
+                # Pause — return this tool call to the browser to execute
+                paused_on = PendingToolCall(
+                    id=tool_id,
+                    name=fc.name,
+                    args=dict(fc.args),
+                )
+                break
+            else:
+                # Server-side — execute immediately
                 try:
                     result = execute_tool(fc.name, dict(fc.args))
                 except Exception as e:
                     result = {"success": False, "error": str(e)}
 
-                tool_results.append(
+                server_results.append(
                     types.Part(
                         function_response=types.FunctionResponse(
-                            name=fc.name,
-                            response=result,
+                            name=fc.name, response=result
                         )
                     )
                 )
 
-            # Append all tool results as a single user turn and loop
-            contents.append(types.Content(role="user", parts=tool_results))
+        if paused_on:
+            # Flush any server-side results we collected before the pause
+            if server_results:
+                contents.append(types.Content(role="user", parts=server_results))
 
+            return AgentResponse(
+                reply=None,
+                pending_tool_call=paused_on,
+                messages=_serialize_contents(contents),
+            )
+
+        # All tools in this batch were server-side — append results and loop
+        contents.append(types.Content(role="user", parts=server_results))
+
+
+@app.post("/api/agent", response_model=AgentResponse)
+async def agent(request: AgentRequest):
+    """Start a new agent turn. Accepts messages with either 'content' or 'parts'."""
+    contents = []
+    for m in request.messages:
+        role = "user" if m.role == "user" else "model"
+
+        if m.parts is not None:
+            # Gemini parts format — reconstruct typed Part objects
+            parts = []
+            for p in m.parts:
+                if p.get("type") == "text":
+                    parts.append(types.Part(text=p["text"]))
+                elif p.get("type") == "function_call":
+                    parts.append(types.Part(
+                        function_call=types.FunctionCall(name=p["name"], args=p.get("args", {}))
+                    ))
+                elif p.get("type") == "function_response":
+                    parts.append(types.Part(
+                        function_response=types.FunctionResponse(
+                            name=p["name"], response=p.get("response", {})
+                        )
+                    ))
+            contents.append(types.Content(role=role, parts=parts))
         else:
-            # Plain text response — we're done
-            text = response.text or "Done."
-            # Serialize contents back to plain dicts for the response
-            messages_out = [{"role": m.role, "content": m.role} for m in request.messages]
-            return AgentResponse(reply=text, messages=messages_out)
+            # Simple content string/dict format
+            text = m.content if isinstance(m.content, str) else json.dumps(m.content)
+            contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
+
+    return await _run_agent_loop(contents)
+
+
+@app.post("/api/agent/resume", response_model=AgentResponse)
+async def resume(request: ResumeRequest):
+    """
+    Resume the agent loop after the client has executed a client-side tool.
+    The client sends back the tool result and the message history from the
+    paused response, and the loop continues from where it left off.
+    """
+    contents = _deserialize_contents(request.messages)
+
+    # Append the client's tool result as a function_response
+    tool_result_part = types.Part(
+        function_response=types.FunctionResponse(
+            name=request.tool_name,
+            response=request.result if isinstance(request.result, dict)
+                     else {"result": request.result},
+        )
+    )
+    contents.append(types.Content(role="user", parts=[tool_result_part]))
+
+    return await _run_agent_loop(contents)
