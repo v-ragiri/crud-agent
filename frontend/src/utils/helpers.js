@@ -232,12 +232,12 @@ const getExistingTabNames = (tabs) => {
  * @returns {string} A unique tab name within the character limit.
  */
 const generateUniqueTabName = (baseName, existingNames) => {
-    var truncated = baseName.substring(0, 10);
+    var truncated = baseName.substring(0, 30);
     if (!existingNames[truncated.toLowerCase()]) {
         existingNames[truncated.toLowerCase()] = true;
         return truncated;
     }
-    var base = baseName.substring(0, 10 - 3); // reserve space for _vX suffix
+    var base = baseName.substring(0, 30 - 3); // reserve space for _vX suffix
     for (var v = 2; v < 100; v++) {
         var name = base + '_v' + v;
         if (!existingNames[name.toLowerCase()]) {
@@ -254,9 +254,9 @@ const generateUniqueTabName = (baseName, existingNames) => {
  * @param {HTMLInputElement} input - The tab name input element to enforce.
  */
 const enforceTabNameLength = (input) => {
-    if (input.value.length > this.state.MAX_TAB_NAME_LENGTH) {
-        input.value = input.value.substring(0, this.state.MAX_TAB_NAME_LENGTH);
-        this.showToast('Tab name truncated to 31 characters');
+    if (input.value.length > 30) {
+        input.value = input.value.substring(0, 30);
+        this.showToast(`Tab name truncated to 30 characters`);
     }
     updateCharCount(input);
     checkDuplicateTabNames();

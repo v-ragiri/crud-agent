@@ -9,6 +9,8 @@ CLIENT_SIDE_TOOLS = {
     "auto_create_tabs_from_tags",
     "remove_tab",
     "remove_all_tabs",
+    "group_cuts_by_question_type",
+    "create_tabs_from_groups",
 }
 
 # ── Tool definitions sent to the model ───────────────────────────────────────
@@ -17,17 +19,34 @@ TOOLS = [
     {
         "name": "auto_create_tabs_from_tags",
         "description": (
-            "Auto-create tabs from tags exactly like the UI Auto-create button: "
-            "create one tab per tag populated with matching cuts and add an "
-            "Untagged tab for cuts without a tag. Reads tags and cuts directly "
-            "from the DOM — no input needed from the user. If asked multiple times, will create new tabs with unique names (e.g. 'Sheet 1', 'Sheet 1_v2', etc)."
+            "Auto-create tabs from tags: create one tab per tag populated with matching cuts. "
+            "By default creates tabs for ALL tags. Use tag_names to create tabs only for "
+            "specific tags. Use include_untagged=true to also add an Untagged tab for cuts "
+            "without any tag (omitted by default when tag_names is set). "
+            "Reads tags and cuts directly from the DOM — no extra input needed. "
+            "If asked multiple times, creates new tabs with unique names (e.g. 'Sheet 1', 'Sheet 1_v2')."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "tag_names": {
+                    "type": "array",
+                    "description": (
+                        "Optional — create tabs only for these tag names (case-insensitive). "
+                        "Omit or leave empty to create tabs for ALL tags."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "include_untagged": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether to also create an Untagged tab for cuts with no tag. "
+                        "Defaults to true when no tag_names filter is given, false otherwise."
+                    ),
+                },
                 "max_tab_name_length": {
                     "type": "integer",
-                    "description": "Maximum tab name length (defaults to 10). Optional.",
+                    "description": "Maximum tab name length (defaults to 30). Optional.",
                 },
             },
         },
@@ -75,11 +94,45 @@ TOOLS = [
         },
     },
     {
+        "name": "group_cuts_by_question_type",
+        "description": (
+            "Analyze cuts from the DOM and suggest logical groups based on question type/content. "
+            "Reads all cuts directly from the DOM — no input needed from the user. "
+            "Returns grouped cuts that user can then opt to create tabs for. "
+            "(Runs on client.)"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "create_tabs_from_groups",
+        "description": (
+            "Create tabs for grouped cuts. Re-classifies cuts by question type and creates a tab for each group. "
+            "Optionally accept custom tab names. (Runs on client — no input required, but can accept tab_names mapping.)"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tab_names": {
+                    "type": "object",
+                    "description": "Optional mapping of group names to custom tab names. E.g. {'Count/Quantity': 'Demographics', 'Multiple Choice': 'Behavior'}",
+                },
+                "auto_name": {
+                    "type": "boolean",
+                    "description": "If true, use suggested group names as tab names directly. Default true.",
+                },
+            },
+        },
+    },
+    {
         "name": "move_cut_between_tabs",
         "description": (
-            "Move one or more cuts from a source tab to a target tab (runs on client). "
-            "Use cut_name for a single cut or cut_names for multiple cuts, plus source_tab "
-            "and target_tab. Source tab, target tab, and every cut name must already exist."
+            "Move cuts between tabs (runs on client). Supports single/multi-cut moves and "
+            "bulk moves. For named cuts, use source_tab + target_tab + cut_name/cut_names. "
+            "For bulk moves, set move_all_cuts=true and use either source_tab, source_tabs, "
+            "or omit both to move all cuts from every tab except target_tab."
         ),
         "input_schema": {
             "type": "object",
@@ -96,14 +149,27 @@ TOOLS = [
                 },
                 "source_tab": {
                     "type": "string",
-                    "description": "Existing source tab name.",
+                    "description": "Existing source tab name (single-source moves).",
+                },
+                "source_tabs": {
+                    "type": "array",
+                    "description": "Existing source tab names for multi-source bulk moves.",
+                    "items": {"type": "string"},
+                    "minItems": 1,
                 },
                 "target_tab": {
                     "type": "string",
                     "description": "Existing target tab name.",
                 },
+                "move_all_cuts": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, move all cuts from selected source tab(s). If source_tab/source_tabs "
+                        "are omitted, moves all cuts from every tab except target_tab."
+                    ),
+                },
             },
-            "required": ["source_tab", "target_tab"],
+            "required": ["target_tab"],
         },
     },
     {

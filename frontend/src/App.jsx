@@ -33,13 +33,36 @@ function executeClientTool(toolName, args, tabsRef) {
   }
 
   if (toolName === "auto_create_tabs_from_tags") {
-    const { max_tab_name_length = 10 } = args;
+    const { max_tab_name_length = 30 } = args;
 
-    // Read cuts and tags fresh from the DOM — args no longer carries them
-    // since the tool schema was simplified to not require user-provided data.
+    // Normalise the optional tag_names filter to a lowercase set (empty = all tags)
+    const requestedTagNames =
+      Array.isArray(args.tag_names) && args.tag_names.length > 0
+        ? new Set(args.tag_names.map((n) => String(n || "").trim().toLowerCase()).filter(Boolean))
+        : null; // null means "all tags"
+
+    // include_untagged defaults to true when no filter is applied, false otherwise
+    const includeUntagged =
+      typeof args.include_untagged === "boolean"
+        ? args.include_untagged
+        : requestedTagNames === null; // default: true for all-tags, false for filtered
+
+    // Read cuts and tags fresh from the DOM
     const cuts = [];
     const tags = [];
     readCutsandTagsFromDOM(cuts, tags);
+
+    // Validate requested tag names against what actually exists in the DOM
+    if (requestedTagNames !== null) {
+      const availableTagNames = new Set(tags.map((t) => (t.name || "").trim().toLowerCase()));
+      const notFound = [...requestedTagNames].filter((n) => !availableTagNames.has(n));
+      if (notFound.length > 0) {
+        return {
+          success: false,
+          error: `Tag(s) not found: ${notFound.join(", ")}. Available tags: ${[...availableTagNames].join(", ")}`,
+        };
+      }
+    }
 
     // Use currently tracked tabs to avoid duplicate names
     const existingNames = {};
@@ -54,10 +77,7 @@ function executeClientTool(toolName, args, tabsRef) {
         return truncated;
       }
       for (let v = 2; v < 100; v++) {
-        const candidate = `${truncated.slice(
-          0,
-          max_tab_name_length - 3
-        )}_v${v}`.slice(0, max_tab_name_length);
+        const candidate = `${truncated.slice(0, max_tab_name_length - 3)}_v${v}`.slice(0, max_tab_name_length);
         if (!existingNames[candidate.toLowerCase()]) {
           existingNames[candidate.toLowerCase()] = true;
           return candidate;
@@ -66,23 +86,29 @@ function executeClientTool(toolName, args, tabsRef) {
       return truncated;
     }
 
+    // Filter tags: use all tags, or only the requested subset
+    const tagsToCreate =
+      requestedTagNames === null
+        ? tags.filter((t) => t.name)
+        : tags.filter((t) => t.name && requestedTagNames.has(t.name.trim().toLowerCase()));
+
     const created = [];
-    for (const tag of tags) {
-      if (!tag.name) continue;
+    for (const tag of tagsToCreate) {
       const cutIds = new Set(tag.cut_ids || []);
       const matching = cuts.filter((c) => cutIds.has(c.id));
       created.push({ name: uniqueName(tag.name), cuts: matching });
     }
 
-    const untagged = cuts.filter((c) => !c.tag);
-    if (untagged.length) {
-      created.push({ name: uniqueName("Untagged"), cuts: untagged });
+    if (includeUntagged) {
+      const untagged = cuts.filter((c) => !c.tag);
+      if (untagged.length) {
+        created.push({ name: uniqueName("Untagged"), cuts: untagged });
+      }
     }
 
-    // Persist tabs into the ref (for fast sync reads by other client tools)
-    // and into state (so CutGroup re-renders with the new tabs)
+    // Persist into ref and re-render CutGroup
     const updatedTabs = [...(tabsRef.current || []), ...created];
-    autoCreateTabsFromTags(null, tags, cuts, tabsRef.current, created); // re-render CutGroup with fresh data
+    autoCreateTabsFromTags(null, tags, cuts, tabsRef.current, created);
     tabsRef.current = updatedTabs;
     return { success: true, created_count: created.length, tabs: created };
   }
@@ -104,9 +130,6 @@ function executeClientTool(toolName, args, tabsRef) {
     const remaining = currentTabs.filter(
       (t) => (t.name || "").toLowerCase().trim() !== targetName
     );
-    const indexRemoved = currentTabs.findIndex(
-      (t) => (t.name || "").toLowerCase().trim() === targetName
-    );
 
     if (removed.length === 0) {
       return {
@@ -114,7 +137,27 @@ function executeClientTool(toolName, args, tabsRef) {
         error: `No tab found with name "${args.tab_name || args.name}"`,
       };
     }
-    deleteTab(`tab_${indexRemoved + 1}`); // remove from DOM
+
+    // Look up the actual data-tab-id from the DOM by matching the tab name
+    // input value — avoids stale index-based IDs after prior deletions.
+    const tabColumns = document.querySelectorAll(".tab-column");
+    let domTabId = null;
+    for (const col of tabColumns) {
+      const input = col.querySelector(".tab-name-input");
+      if (input && input.value.trim().toLowerCase() === targetName) {
+        domTabId = col.getAttribute("data-tab-id");
+        break;
+      }
+    }
+
+    if (!domTabId) {
+      return {
+        success: false,
+        error: `Tab "${args.tab_name || args.name}" not found in DOM`,
+      };
+    }
+
+    deleteTab(domTabId);
     tabsRef.current = remaining;
     return {
       success: true,
@@ -141,11 +184,174 @@ function executeClientTool(toolName, args, tabsRef) {
     };
   }
 
+  if (toolName === "group_cuts_by_question_type") {
+    const cuts = [];
+    const tags = [];
+    readCutsandTagsFromDOM(cuts, tags);
+
+    if (cuts.length === 0) {
+      return {
+        success: true,
+        grouped_count: 0,
+        groups: [],
+        message: "No cuts found to group.",
+      };
+    }
+
+    // Helper to classify question type based on keywords in the text
+    function classifyQuestionType(text) {
+      const lower = (text || "").toLowerCase();
+      if (/\bhow many\b|\bcount\b|\bnumber of\b/.test(lower)) return "Count/Quantity";
+      if (/\bwhich of\b|\bchoose\b|\bselect\b/.test(lower)) return "Multiple Choice";
+      if (/\bscale\b|\blikelihood\b|\brate\b|\bfrom.*to\b/.test(lower)) return "Scale/Rating";
+      if (/\byou indicated\b|\byou are\b|\bif.*then\b|\binvolved in\b/.test(lower))
+        return "Conditional/Behavioral";
+      if (/\bdescribe\b|\bhow well\b|\bperform\b/.test(lower)) return "Performance/Descriptive";
+      if (/\bwhat\b|\bwhen\b|\bwhere\b|\bwhy\b/.test(lower)) return "Open-ended";
+      return "Other";
+    }
+
+    // Group cuts by question type
+    const groupMap = {};
+    cuts.forEach((cut) => {
+      const qType = classifyQuestionType(cut.name);
+      if (!groupMap[qType]) {
+        groupMap[qType] = { groupName: qType, cuts: [] };
+      }
+      groupMap[qType].cuts.push(cut);
+    });
+
+    // Convert to array and add metadata
+    const groups = Object.values(groupMap).map((g) => ({
+      ...g,
+      cut_count: g.cuts.length,
+      groupDescription: `Contains ${g.cuts.length} question(s) of type: ${g.groupName}`,
+    }));
+
+    // Sort by group name for consistency
+    groups.sort((a, b) => a.groupName.localeCompare(b.groupName));
+
+    return {
+      success: true,
+      grouped_count: groups.length,
+      total_cuts: cuts.length,
+      groups: groups,
+      message: `Identified ${groups.length} groups from ${cuts.length} cuts. User can now create tabs for each group.`,
+    };
+  }
+
+  if (toolName === "create_tabs_from_groups") {
+    const cuts = [];
+    const tags = [];
+    readCutsandTagsFromDOM(cuts, tags);
+
+    if (cuts.length === 0) {
+      return {
+        success: false,
+        error: "No cuts found to group.",
+      };
+    }
+
+    // Helper to classify question type (same logic as group_cuts_by_question_type)
+    function classifyQuestionType(text) {
+      const lower = (text || "").toLowerCase();
+      if (/\bhow many\b|\bcount\b|\bnumber of\b/.test(lower)) return "Count/Quantity";
+      if (/\bwhich of\b|\bchoose\b|\bselect\b/.test(lower)) return "Multiple Choice";
+      if (/\bscale\b|\blikelihood\b|\brate\b|\bfrom.*to\b/.test(lower)) return "Scale/Rating";
+      if (/\byou indicated\b|\byou are\b|\bif.*then\b|\binvolved in\b/.test(lower))
+        return "Conditional/Behavioral";
+      if (/\bdescribe\b|\bhow well\b|\bperform\b/.test(lower)) return "Performance/Descriptive";
+      if (/\bwhat\b|\bwhen\b|\bwhere\b|\bwhy\b/.test(lower)) return "Open-ended";
+      return "Other";
+    }
+
+    // Group cuts by question type
+    const groupMap = {};
+    cuts.forEach((cut) => {
+      const qType = classifyQuestionType(cut.name);
+      if (!groupMap[qType]) {
+        groupMap[qType] = { groupName: qType, cuts: [] };
+      }
+      groupMap[qType].cuts.push(cut);
+    });
+
+    // Convert to array and sort for consistency
+    const groups = Object.values(groupMap).sort((a, b) =>
+      a.groupName.localeCompare(b.groupName)
+    );
+
+    // Apply custom tab names if provided
+    const tabNameMapping = args.tab_names || {};
+    const autoName = typeof args.auto_name === "boolean" ? args.auto_name : true;
+
+    // Track existing tab names to avoid duplicates
+    const existingNames = {};
+    (tabsRef.current || []).forEach((t) => {
+      existingNames[t.name.toLowerCase()] = true;
+    });
+
+    function getUniqueName(baseName) {
+      const lower = baseName.toLowerCase();
+      if (!existingNames[lower]) {
+        existingNames[lower] = true;
+        return baseName;
+      }
+      for (let v = 2; v < 100; v++) {
+        const candidate = `${baseName}_v${v}`;
+        if (!existingNames[candidate.toLowerCase()]) {
+          existingNames[candidate.toLowerCase()] = true;
+          return candidate;
+        }
+      }
+      return baseName;
+    }
+
+    // Create tabs for each group
+    const created = [];
+    for (const group of groups) {
+      let tabName;
+      if (autoName) {
+        // Use custom name if provided, otherwise use group name
+        tabName = tabNameMapping[group.groupName] || group.groupName;
+      } else {
+        tabName = tabNameMapping[group.groupName];
+        if (!tabName) {
+          return {
+            success: false,
+            error: `Custom tab name not provided for group "${group.groupName}". Pass tab_names mapping or set auto_name=true.`,
+          };
+        }
+      }
+
+      tabName = getUniqueName(tabName);
+      created.push({
+        name: tabName,
+        cuts: group.cuts,
+      });
+    }
+
+    // Persist into ref and render
+    const updatedTabs = [...(tabsRef.current || []), ...created];
+    autoCreateTabsFromTags(null, tags, cuts, tabsRef.current, created);
+    tabsRef.current = updatedTabs;
+
+    return {
+      success: true,
+      created_count: created.length,
+      tabs: created.map((t) => ({
+        name: t.name,
+        cut_count: t.cuts.length,
+      })),
+      message: `Created ${created.length} tabs from ${groups.length} groups.`,
+    };
+  }
+
   if (toolName === "move_cut_between_tabs") {
     const singleCutNameRaw = (args.cut_name || "").trim();
     const multiCutNamesRaw = Array.isArray(args.cut_names)
       ? args.cut_names.map((n) => String(n || "").trim()).filter(Boolean)
       : [];
+    const moveAllCuts = args.move_all_cuts === true;
     const sourceTabRaw = (args.source_tab || "").trim();
     const targetTabRaw = (args.target_tab || "").trim();
 
@@ -156,17 +362,15 @@ function executeClientTool(toolName, args, tabsRef) {
         ? [singleCutNameRaw]
         : [];
 
-    if (!sourceTabRaw || !targetTabRaw || requestedCutNamesRaw.length === 0) {
+    if (!sourceTabRaw || !targetTabRaw || (!moveAllCuts && requestedCutNamesRaw.length === 0)) {
       return {
         success: false,
         error:
-          "Missing required fields: source_tab, target_tab, and cut_name or cut_names",
+          "Missing required fields: source_tab, target_tab, and cut_name/cut_names (or set move_all_cuts=true)",
       };
     }
 
-    const requestedCutNames = requestedCutNamesRaw.map((name) =>
-      name.toLowerCase()
-    );
+    const requestedCutNames = requestedCutNamesRaw.map((name) => name.toLowerCase());
     const sourceTab = sourceTabRaw.toLowerCase();
     const targetTab = targetTabRaw.toLowerCase();
 
@@ -193,40 +397,131 @@ function executeClientTool(toolName, args, tabsRef) {
     }
 
     const sourceCuts = currentTabs[sourceIndex].cuts || [];
-    const sourceCutsByName = new Map();
-    sourceCuts.forEach((c) => {
-      const key = (c.name || "").trim().toLowerCase();
-      if (!sourceCutsByName.has(key)) {
-        sourceCutsByName.set(key, []);
+    let movedCuts = [];
+
+    if (moveAllCuts) {
+      movedCuts = [...sourceCuts];
+    } else {
+      const sourceCutsByName = new Map();
+      sourceCuts.forEach((c) => {
+        const key = (c.name || "").trim().toLowerCase();
+        if (!sourceCutsByName.has(key)) {
+          sourceCutsByName.set(key, []);
+        }
+        sourceCutsByName.get(key).push(c);
+      });
+
+      const missingCuts = requestedCutNamesRaw.filter((rawName, idx) => {
+        const lowered = requestedCutNames[idx];
+        return (
+          !sourceCutsByName.has(lowered) ||
+          sourceCutsByName.get(lowered).length === 0
+        );
+      });
+
+      if (missingCuts.length > 0) {
+        return {
+          success: false,
+          error: `Cuts not found in source tab "${
+            currentTabs[sourceIndex].name
+          }": ${missingCuts.join(", ")}`,
+        };
       }
-      sourceCutsByName.get(key).push(c);
-    });
 
-    const missingCuts = requestedCutNamesRaw.filter((rawName, idx) => {
-      const lowered = requestedCutNames[idx];
-      return (
-        !sourceCutsByName.has(lowered) ||
-        sourceCutsByName.get(lowered).length === 0
-      );
-    });
+      requestedCutNames.forEach((name) => {
+        const bucket = sourceCutsByName.get(name);
+        if (bucket && bucket.length > 0) {
+          movedCuts.push(bucket.shift());
+        }
+      });
+    }
 
-    if (missingCuts.length > 0) {
+    if (movedCuts.length === 0) {
       return {
-        success: false,
-        error: `Cuts not found in source tab \"${
-          currentTabs[sourceIndex].name
-        }\": ${missingCuts.join(", ")}`,
+        success: true,
+        moved_count: 0,
+        moved_cuts: [],
+        source_tab: currentTabs[sourceIndex].name,
+        target_tab: currentTabs[targetIndex].name,
+        source_cut_count: currentTabs[sourceIndex].cuts.length,
+        target_cut_count: currentTabs[targetIndex].cuts.length,
+        tabs: currentTabs,
       };
     }
 
-    const movedCuts = [];
-    requestedCutNames.forEach((name) => {
-      const bucket = sourceCutsByName.get(name);
-      if (bucket && bucket.length > 0) {
-        movedCuts.push(bucket.shift());
+    // Resolve actual DOM tab-ids by name — array indices are unreliable after deletions
+    const allTabColumns = document.querySelectorAll(".tab-column");
+    let sourceTabDomId = null;
+    let targetTabDomId = null;
+    for (const col of allTabColumns) {
+      const input = col.querySelector(".tab-name-input");
+      if (!input) continue;
+      const colName = input.value.trim().toLowerCase();
+      if (colName === sourceTab) sourceTabDomId = col.getAttribute("data-tab-id");
+      if (colName === targetTab) targetTabDomId = col.getAttribute("data-tab-id");
+    }
+
+    if (!sourceTabDomId) {
+      return { success: false, error: `Source tab "${sourceTabRaw}" not found in DOM` };
+    }
+    if (!targetTabDomId) {
+      return { success: false, error: `Target tab "${targetTabRaw}" not found in DOM` };
+    }
+
+    const sourceDropzone = document.getElementById(`dropzone_${sourceTabDomId}`);
+    const targetDropzone = document.getElementById(`dropzone_${targetTabDomId}`);
+
+    if (!sourceDropzone || !targetDropzone) {
+      return {
+        success: false,
+        error: "Could not locate one or both tab drop zones in the DOM",
+      };
+    }
+
+    // Collect all matching DOM elements from the source dropzone up front,
+    // before any mutations, so that removals don't affect subsequent lookups.
+    const allSourceItems = Array.from(sourceDropzone.querySelectorAll(".tab-cut-item"));
+    const movedElements = [];
+    const domMissingCuts = [];
+    movedCuts.forEach((cut) => {
+      const el = allSourceItems.find(
+        (item) => (item.getAttribute("data-cut-id") || "").trim() === cut.id
+      );
+      if (el) {
+        movedElements.push(el);
+      } else {
+        domMissingCuts.push(cut.name);
       }
     });
 
+    if (domMissingCuts.length > 0) {
+      return {
+        success: false,
+        error: `Could not locate in source tab DOM: ${domMissingCuts.join(", ")}`,
+      };
+    }
+
+    // Prepare target dropzone
+    targetDropzone.classList.remove("empty-state");
+    const targetPlaceholder = targetDropzone.querySelector(".placeholder-text");
+    if (targetPlaceholder) {
+      targetPlaceholder.remove();
+    }
+
+    // Move elements: detach from source, append to target
+    movedElements.forEach((el) => {
+      el.remove();
+      targetDropzone.appendChild(el);
+    });
+
+    // Restore empty-state on source if it has no cuts left
+    if (!sourceDropzone.querySelector(".tab-cut-item")) {
+      sourceDropzone.classList.add("empty-state");
+      sourceDropzone.innerHTML =
+        '<span class="placeholder-text">Drop cuts here</span>';
+    }
+
+    // Update in-memory state after DOM mutations succeeded
     const updatedTabs = currentTabs.map((tab) => ({
       ...tab,
       cuts: [...(tab.cuts || [])],
@@ -236,55 +531,6 @@ function executeClientTool(toolName, args, tabsRef) {
       (c) => !movedCutIds.has(c.id)
     );
     updatedTabs[targetIndex].cuts.push(...movedCuts);
-
-    const sourceTabId = `tab_${sourceIndex + 1}`;
-    const targetTabId = `tab_${targetIndex + 1}`;
-    const sourceDropzone = document.getElementById(`dropzone_${sourceTabId}`);
-    const targetDropzone = document.getElementById(`dropzone_${targetTabId}`);
-
-    if (!sourceDropzone || !targetDropzone) {
-      return {
-        success: false,
-        error: "Could not locate one or both tab drop zones in the DOM",
-      };
-    }
-
-    const movedElements = [];
-    movedCuts.forEach((cut) => {
-      const cutElement = Array.from(
-        sourceDropzone.querySelectorAll(".tab-cut-item")
-      ).find((el) => {
-        const idAttr = (el.getAttribute("data-cut-id") || "").trim();
-        return idAttr === cut.id;
-      });
-      if (cutElement) {
-        movedElements.push(cutElement);
-      }
-    });
-
-    if (movedElements.length !== movedCuts.length) {
-      return {
-        success: false,
-        error: "Could not locate one or more requested cuts in source tab DOM",
-      };
-    }
-
-    targetDropzone.classList.remove("empty-state");
-    const targetPlaceholder = targetDropzone.querySelector(".placeholder-text");
-    if (targetPlaceholder) {
-      targetPlaceholder.remove();
-    }
-
-    movedElements.forEach((el) => {
-      el.remove();
-      targetDropzone.appendChild(el);
-    });
-
-    if (!sourceDropzone.querySelector(".tab-cut-item")) {
-      sourceDropzone.classList.add("empty-state");
-      sourceDropzone.innerHTML =
-        '<span class="placeholder-text">Drop cuts here</span>';
-    }
 
     tabsRef.current = updatedTabs;
     updateStats();
